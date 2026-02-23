@@ -305,6 +305,40 @@ def main():
 
     macro_f1, per_class_f1, support = masked_f1_from_binary(y_true_all, y_pred_all, views_all, cls_allowed)
 
+    # ---- Per-class confusion stats (view-masked) ----
+    if y_true_all.shape[0] > 0:
+        allowed_mask = build_allowed_mask_np(views_all, cls_allowed, num_classes=K)  # (N,K)
+    else:
+        allowed_mask = np.zeros((0, K), dtype=np.uint8)
+
+    per_class_tp = np.zeros(K, dtype=np.int64)
+    per_class_tn = np.zeros(K, dtype=np.int64)
+    per_class_fp = np.zeros(K, dtype=np.int64)
+    per_class_fn = np.zeros(K, dtype=np.int64)
+    per_class_precision = np.zeros(K, dtype=np.float32)
+    per_class_recall = np.zeros(K, dtype=np.float32)
+
+    for k in range(K):
+        m = allowed_mask[:, k] == 1
+        if m.sum() == 0:
+            continue
+
+        y_t = y_true_all[m, k]
+        y_p = y_pred_all[m, k]
+
+        tp = int(((y_p == 1) & (y_t == 1)).sum())
+        tn = int(((y_p == 0) & (y_t == 0)).sum())
+        fp = int(((y_p == 1) & (y_t == 0)).sum())
+        fn = int(((y_p == 0) & (y_t == 1)).sum())
+
+        per_class_tp[k] = tp
+        per_class_tn[k] = tn
+        per_class_fp[k] = fp
+        per_class_fn[k] = fn
+
+        per_class_precision[k] = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+        per_class_recall[k] = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+
     logger.info("====== Seg Metrics ======")
     for cls_idx in range(C - 1):
         logger.info(
@@ -316,7 +350,11 @@ def main():
     logger.info("====== Cls Metrics (View-masked, Binary) ======")
     logger.info(f"Macro-F1: {macro_f1:.4f}")
     for k in range(K):
-        logger.info(f"Class[{k}] F1={per_class_f1[k]:.4f} | support={support[k]}")
+        logger.info(
+            f"Class[{k}] F1={per_class_f1[k]:.4f} | support={support[k]} | "
+            f"P={per_class_precision[k]:.4f} R={per_class_recall[k]:.4f} | "
+            f"TP={per_class_tp[k]} TN={per_class_tn[k]} FP={per_class_fp[k]} FN={per_class_fn[k]}"
+        )
 
     result = {
         "mean_dice": mean_dice,
@@ -324,6 +362,12 @@ def main():
         "masked_macro_f1": macro_f1,
         "masked_per_class_f1": per_class_f1.tolist(),
         "masked_support": support.tolist(),
+        "masked_per_class_precision": per_class_precision.tolist(),
+        "masked_per_class_recall": per_class_recall.tolist(),
+        "masked_per_class_tp": per_class_tp.tolist(),
+        "masked_per_class_tn": per_class_tn.tolist(),
+        "masked_per_class_fp": per_class_fp.tolist(),
+        "masked_per_class_fn": per_class_fn.tolist(),
         "dice_class": dice_class.tolist(),
         "nsd_class": nsd_class.tolist(),
         "cnt": cnt.tolist(),

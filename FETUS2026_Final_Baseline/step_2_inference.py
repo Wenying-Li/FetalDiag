@@ -10,6 +10,8 @@ import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
+from model.unet import UNet  
+from model.Echocare import Echocare_UniMatch 
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -24,6 +26,25 @@ DEFAULT_SEG_ALLOWED: Dict[int, List[int]] = {
     3: [0, 9, 12, 13, 14],                 # 3VT
 }
 
+def build_model(args, device):
+    if args.model == "unet":
+        model = UNet(
+            in_chns=1,
+            seg_class_num=args.seg_num_classes,
+            cls_class_num=args.cls_num_classes, 
+            view_num_classes=args.view_num_classes,
+        )
+    elif args.model == "echocare":  
+        model = Echocare_UniMatch(  
+            in_chns=1,  
+            seg_class_num=args.seg_num_classes,  
+            cls_class_num=args.cls_num_classes,  
+            view_num_classes=args.view_num_classes,  
+            ssl_checkpoint=None,  # Not needed at inference; checkpoint contains fine-tuned weights  
+        )  
+    else:  
+        raise ValueError(f"Unknown model: {args.model}")  
+    return model.to(device) 
 
 def setup_logger(save_dir: str) -> logging.Logger:
     os.makedirs(save_dir, exist_ok=True)
@@ -234,6 +255,7 @@ def parse_args():
                    help="JSON for inference (image paths; view ids required if --mask-mode oracle)")
     p.add_argument("--ckpt", type=str, default='./checkpoints/best.pth', help="checkpoint path (.pth)")
     p.add_argument("--out-dir", type=str, default="./output")
+    p.add_argument("--model", type=str, default="unet", choices=["unet", "echocare"])
 
     p.add_argument("--resize-target", type=int, default=256)
     p.add_argument("--seg-num-classes", type=int, default=15)
@@ -277,12 +299,7 @@ def main():
     seg_allowed = load_seg_allowed(args.seg_allowed, DEFAULT_SEG_ALLOWED)
     allowed_mat = build_allowed_mat(device, seg_allowed, args.view_num_classes, args.seg_num_classes)
 
-    model = UNet(
-        in_chns=1,
-        seg_class_num=args.seg_num_classes,
-        cls_class_num=args.cls_num_classes,
-        view_num_classes=args.view_num_classes,
-    ).to(device)
+    model = build_model(args, device)
     logger.info(f"Total params: {count_params_m(model):.1f}M")
 
     load_checkpoint_strict(model, args.ckpt, device, logger)
