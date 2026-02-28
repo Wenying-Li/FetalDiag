@@ -1,6 +1,0 @@
-[19:03:07.981] Namespace(data_json='val/valid.json', ckpt='./checkpoints_baseline_echocare/SAM/best.pth', out_dir='./SAM_new_val', model='echocare', resize_target=256, seg_num_classes=15, cls_num_classes=7, view_num_classes=4, label_mode='binary', cls_thr=0.5, cls_thr_per_class='0.71,0.5,0.99,0.5,0.63,0.56,0.83', batch_size=1, num_workers=2, gpu='0', mask_mode='oracle', seg_allowed=None, amp=False, amp_dtype='fp16', overwrite=False)
-[19:03:07.983] Device: cuda:0
-[19:03:14.703] Total params: 174.6M
-[19:03:19.812] Loaded checkpoint: ./checkpoints_baseline_echocare/SAM/best.pth
-[19:03:19.824] Samples: 500
-[19:06:30.696] Saved predictions to: ./SAM_new_val
