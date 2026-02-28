@@ -1,0 +1,17 @@
+[15:10:37.554] Namespace(model='echocare', opt='echocare', ssl_ckpt='./pretrained_weights/echocare_encoder.pth', train_labeled_json='data/train_labeled.json', train_unlabeled_json='data/train_unlabeled.json', valid_labeled_json='data/valid.json', train_epochs=40, batch_size=8, base_lr=0.001, conf_thresh=0.9, seg_num_classes=15, cls_num_classes=7, view_num_classes=4, resize_target=256, save_path='./checkpoint_baseline_echocare/default_s', tb_logdir=None, tb_iter_freq=20, amp=True, amp_dtype='fp16', gpu='2', no_hard_view_mask=False, small_sample=True, small_sample_ratio=0.1, small_sample_min_cases=16, small_sample_seed=42, seg_allowed=None, cls_allowed=None, pseudo_tau_pos=0.8, pseudo_tau_neg=0.8, loss_weights=None)
+[15:10:37.555] seg_allowed: {0: [0, 1, 2, 3, 4, 5, 6, 7], 1: [0, 1, 2, 4, 8], 2: [0, 6, 8, 9, 10, 11, 12], 3: [0, 9, 12, 13, 14]}
+[15:10:37.556] cls_allowed: {0: [0, 1], 1: [0, 2, 3], 2: [4, 5], 3: [2, 5, 6]}
+[15:10:37.556] loss_weights: {'x_seg': 1.0, 'x_cls': 1.0, 'x_fp_cls': 1.0, 'u_s1_seg': 0.25, 'u_s2_seg': 0.25, 'u_w_fp_seg': 0.5, 'u_s1_mix_seg': 0.25, 'u_s2_mix_seg': 0.25, 'u_pseudo_cls': 1.0, 'u_w_mix_cls': 0.25, 'u_w_mix_fp_cls': 0.5}
+[15:10:37.557] pseudo_tau_pos=0.8, pseudo_tau_neg=0.8
+[15:10:37.560] TensorBoard logdir: ./checkpoint_baseline_echocare/default_s/tb
+[15:10:43.780] [SmallSample] enabled | unlabeled train subset: 241/2409 (10.00%) | seed=42
+[15:15:13.885] pos_weight (masked by cls_allowed): [ 9.118519 14.204082 15.970589 17.848484  9.24     12.384615  9.66    ]
+[15:15:13.886] ===========> Epoch: 0 | LR: 0.000100 | Best: 0.0000 @ epoch -1
+[15:15:41.015] Iter 0/30 | L=nan | X(seg=1.379, cls=nan, fp_cls=nan) | U(seg_s1=0.853, seg_s2=0.859, fp_seg=0.832, mix_s1=0.609, mix_s2=0.604, pseudo_cls=nan, w_mix_cls=nan, w_mix_fp_cls=nan) | mask(seg=0.002, cls=0.054)
+[15:16:16.356] Iter 3/30 | L=nan | X(seg=1.316, cls=nan, fp_cls=nan) | U(seg_s1=0.830, seg_s2=0.840, fp_seg=0.767, mix_s1=0.599, mix_s2=0.630, pseudo_cls=nan, w_mix_cls=nan, w_mix_fp_cls=nan) | mask(seg=0.001, cls=0.045)
+[15:16:51.990] Iter 6/30 | L=nan | X(seg=1.347, cls=nan, fp_cls=nan) | U(seg_s1=0.843, seg_s2=0.852, fp_seg=0.751, mix_s1=0.639, mix_s2=0.652, pseudo_cls=nan, w_mix_cls=nan, w_mix_fp_cls=nan) | mask(seg=0.001, cls=0.041)
+[15:17:25.820] Iter 9/30 | L=nan | X(seg=1.337, cls=nan, fp_cls=nan) | U(seg_s1=0.844, seg_s2=0.847, fp_seg=0.735, mix_s1=0.611, mix_s2=0.642, pseudo_cls=nan, w_mix_cls=nan, w_mix_fp_cls=nan) | mask(seg=0.002, cls=0.048)
+[15:17:58.258] Iter 12/30 | L=nan | X(seg=1.339, cls=nan, fp_cls=nan) | U(seg_s1=0.835, seg_s2=0.832, fp_seg=0.721, mix_s1=0.598, mix_s2=0.623, pseudo_cls=nan, w_mix_cls=nan, w_mix_fp_cls=nan) | mask(seg=0.001, cls=0.054)
+[15:18:27.413] Iter 15/30 | L=nan | X(seg=1.342, cls=nan, fp_cls=nan) | U(seg_s1=0.837, seg_s2=0.837, fp_seg=0.725, mix_s1=0.584, mix_s2=0.615, pseudo_cls=nan, w_mix_cls=nan, w_mix_fp_cls=nan) | mask(seg=0.001, cls=0.059)
+[15:19:01.611] Iter 18/30 | L=nan | X(seg=1.347, cls=nan, fp_cls=nan) | U(seg_s1=0.836, seg_s2=0.835, fp_seg=0.724, mix_s1=0.586, mix_s2=0.615, pseudo_cls=nan, w_mix_cls=nan, w_mix_fp_cls=nan) | mask(seg=0.001, cls=0.060)
+[15:19:39.831] Iter 21/30 | L=nan | X(seg=1.346, cls=nan, fp_cls=nan) | U(seg_s1=0.842, seg_s2=0.842, fp_seg=0.724, mix_s1=0.592, mix_s2=0.618, pseudo_cls=nan, w_mix_cls=nan, w_mix_fp_cls=nan) | mask(seg=0.001, cls=0.062)

@@ -287,6 +287,16 @@ def maybe_resume(model, optimizer, scaler, ckpt_path: str, logger: logging.Logge
     return start_epoch, best_score, best_epoch, global_step
 
 
+def forward_model(model, image, need_fp: bool = False, view_ids=None):
+    """Compatibility wrapper: pass view_ids when supported, otherwise fall back."""
+    try:
+        return model(image, need_fp=need_fp, view_ids=view_ids)
+    except TypeError:
+        if need_fp:
+            return model(image, need_fp)
+        return model(image)
+
+
 @torch.no_grad()
 def teacher_pseudo(
     model,
@@ -300,7 +310,7 @@ def teacher_pseudo(
 ):
     model.eval()
 
-    pred_u_w_mix, cls_u_w_mix = model(image_u_w_mix)
+    pred_u_w_mix, cls_u_w_mix = forward_model(model, image_u_w_mix, need_fp=False, view_ids=view_u_mix)
     p_t = torch.sigmoid(cls_u_w_mix)
 
     conf_mask = ((p_t >= tau_pos) | (p_t <= 1 - tau_neg)).float()
@@ -418,7 +428,7 @@ def train_one_epoch(
         
         model.train()
         with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
-            (preds, preds_fp), (preds_class, preds_class_fp) = model(torch.cat((image_x, image_u_w)), True)
+            (preds, preds_fp), (preds_class, preds_class_fp) = forward_model(model, torch.cat((image_x, image_u_w)), need_fp=True, view_ids=torch.cat((view_x, view_u), dim=0))
 
             pred_x, pred_u_w = preds.split([num_l, num_u])
             _, pred_u_w_fp = preds_fp.split([num_l, num_u])
@@ -426,13 +436,13 @@ def train_one_epoch(
             pred_x_class, _ = preds_class.split([num_l, num_u])
             pred_x_class_fp, _ = preds_class_fp.split([num_l, num_u])
 
-            pred_u_s_outs, _ = model(torch.cat((image_u_s1, image_u_s2)))
+            pred_u_s_outs, _ = forward_model(model, torch.cat((image_u_s1, image_u_s2)), need_fp=False, view_ids=torch.cat((view_u, view_u), dim=0))
             pred_u_s1, pred_u_s2 = pred_u_s_outs.chunk(2)
 
-            pred_u_s1_mix, pred_class_u_s1_mix = model(image_u_s1_mix)
-            pred_u_s2_mix, pred_class_u_s2_mix = model(image_u_s2_mix)
+            pred_u_s1_mix, pred_class_u_s1_mix = forward_model(model, image_u_s1_mix, need_fp=False, view_ids=view_u_mix)
+            pred_u_s2_mix, pred_class_u_s2_mix = forward_model(model, image_u_s2_mix, need_fp=False, view_ids=view_u_mix)
 
-            (_, _), (pred_class_u_w_mix, pred_class_u_w_mix_fp) = model(image_u_w_mix, True)
+            (_, _), (pred_class_u_w_mix, pred_class_u_w_mix_fp) = forward_model(model, image_u_w_mix, need_fp=True, view_ids=view_u_mix)
 
         pred_u_w_det = pred_u_w.detach()
         if use_hard_view_mask:
@@ -637,7 +647,7 @@ def validate(args, model, device, valid_loader, allowed_seg_mat, cls_allowed):
             mode="bilinear", align_corners=False
         )
 
-        pred_mask_logits_rs, pred_class_out = model(image_rs)
+        pred_mask_logits_rs, pred_class_out = forward_model(model, image_rs, need_fp=False, view_ids=v)
         pred_mask_logits = F.interpolate(
             pred_mask_logits_rs, (h, w),
             mode="bilinear", align_corners=False
