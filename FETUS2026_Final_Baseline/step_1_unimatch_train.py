@@ -10,7 +10,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.optim import SGD
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset.fetus import FETUSSemiDataset
@@ -226,6 +226,14 @@ def parse_args():
              + ",".join(sorted(DEFAULT_LOSS_WEIGHTS.keys())),
     )
 
+    p.add_argument("--small-sample", action="store_true", help="Use a smaller unlabeled subset for quick validation runs.")
+    p.add_argument("--small-sample-ratio", type=float, default=0.2, help="Fraction of unlabeled data to keep when --small-sample is enabled.")
+    p.add_argument("--small-sample-min-cases", type=int, default=16, help="Minimum number of unlabeled cases to keep in small-sample mode.")
+    p.add_argument("--small-sample-seed", type=int, default=42, help="Random seed for deterministic small-sample subset selection.")
+
+    p.add_argument("--no-prior-warmup", action="store_true", help="Disable segmentation-prior warmup and keep priors on from epoch 0.")
+    p.add_argument("--prior-warmup-epochs", type=int, default=5, help="Number of initial epochs to keep segmentation priors off when warmup is enabled.")
+
     return p.parse_args()
 
 
@@ -296,6 +304,14 @@ def forward_model(model, image, need_fp: bool = False, view_ids=None):
             return model(image, need_fp)
         return model(image)
 
+
+
+
+def set_prior_usage(model, enabled: bool):
+    """Enable/disable segmentation-derived class-specific priors if the model exposes the flag."""
+    target = model.module if hasattr(model, "module") else model
+    if hasattr(target, "enable_struct_priors"):
+        target.enable_struct_priors = bool(enabled)
 
 @torch.no_grad()
 def teacher_pseudo(
@@ -720,6 +736,8 @@ def main():
     logger.info(f"cls_allowed: {cls_allowed}")
     logger.info(f"loss_weights: {loss_w}")
     logger.info(f"pseudo_tau_pos={args.pseudo_tau_pos}, pseudo_tau_neg={args.pseudo_tau_neg}")
+    logger.info(f"prior_warmup_enabled={not args.no_prior_warmup}, prior_warmup_epochs={args.prior_warmup_epochs}")
+    logger.info(f"small_sample={args.small_sample}, ratio={args.small_sample_ratio}, min_cases={args.small_sample_min_cases}, seed={args.small_sample_seed}")
 
     tb_logdir = args.tb_logdir or os.path.join(args.save_path, "tb")
     writer = SummaryWriter(log_dir=tb_logdir)
@@ -736,12 +754,24 @@ def main():
     allowed_seg_mat = build_seg_allowed_mat(device, seg_allowed, args.view_num_classes, args.seg_num_classes)
     allowed_cls_mat = build_allowed_mat(device, cls_allowed, num_views=args.view_num_classes, num_classes=args.cls_num_classes)
 
-    db_train_u = FETUSSemiDataset(args.train_unlabeled_json, "train_u", size=args.resize_target)
+    db_train_u_full = FETUSSemiDataset(args.train_unlabeled_json, "train_u", size=args.resize_target)
+    db_train_u = db_train_u_full
+    if args.small_sample:
+        total_u = len(db_train_u_full)
+        keep_u = min(total_u, max(args.small_sample_min_cases, int(round(total_u * args.small_sample_ratio))))
+        if keep_u <= 0:
+            raise ValueError("small-sample produced an empty unlabeled subset; increase --small-sample-ratio or --small-sample-min-cases.")
+        g = torch.Generator()
+        g.manual_seed(args.small_sample_seed)
+        subset_idx = torch.randperm(total_u, generator=g)[:keep_u].tolist()
+        db_train_u = Subset(db_train_u_full, subset_idx)
+        logger.info(f"[SmallSample] Using {keep_u}/{total_u} unlabeled samples.")
+
     db_train_l = FETUSSemiDataset(
         args.train_labeled_json,
         "train_l",
         size=args.resize_target,
-        n_sample=len(db_train_u.case_list),
+        n_sample=len(db_train_u_full.case_list),
     )
     db_valid = FETUSSemiDataset(args.valid_labeled_json, "valid")
 
@@ -749,6 +779,9 @@ def main():
     train_loader_u = DataLoader(db_train_u, batch_size=args.batch_size, shuffle=True, num_workers=1, drop_last=True)
     train_loader_u_mix = DataLoader(db_train_u, batch_size=args.batch_size, shuffle=True, num_workers=1, drop_last=True)
     valid_loader = DataLoader(db_valid, batch_size=1, pin_memory=True, num_workers=1, drop_last=False)
+
+    if len(train_loader_u) == 0:
+        raise ValueError("train_loader_u is empty. Increase --small-sample-ratio / --small-sample-min-cases or reduce --batch-size.")
 
     pos_weight = compute_pos_weight_from_loader(train_loader_l, allowed_cls_mat, args.cls_num_classes, device).to(device)
     logger.info(f"pos_weight (masked by cls_allowed): {pos_weight.detach().cpu().numpy()}")
@@ -758,9 +791,11 @@ def main():
     start_epoch, best_score, best_epoch, global_step = maybe_resume(model, optimizer, scaler, ckpt_path, logger)
 
     for epoch in range(start_epoch + 1, args.train_epochs):
+        use_priors_this_epoch = args.no_prior_warmup or (epoch >= args.prior_warmup_epochs)
+        set_prior_usage(model, use_priors_this_epoch)
         logger.info(
-            "===========> Epoch: {} | LR: {:.6f} | Best: {:.4f} @ epoch {}".format(
-                epoch, optimizer.param_groups[0]["lr"], best_score, best_epoch
+            "===========> Epoch: {} | LR: {:.6f} | Best: {:.4f} @ epoch {} | struct_priors={}".format(
+                epoch, optimizer.param_groups[0]["lr"], best_score, best_epoch, use_priors_this_epoch
             )
         )
 

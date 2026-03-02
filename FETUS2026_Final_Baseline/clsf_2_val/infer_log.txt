@@ -1,0 +1,6 @@
+[09:08:23.701] Namespace(data_json='val/valid.json', ckpt='./checkpoints_baseline_echocare/clsf_2/best.pth', out_dir='./clsf_2_val', model='echocare', resize_target=256, seg_num_classes=15, cls_num_classes=7, view_num_classes=4, label_mode='binary', cls_thr=0.5, cls_thr_per_class='0.67,0.6,0.99,0.6,0.65,0.84,0.79', batch_size=1, num_workers=2, gpu='0', mask_mode='oracle', seg_allowed=None, amp=False, amp_dtype='fp16', overwrite=False)
+[09:08:23.701] Device: cuda:0
+[09:08:29.903] Total params: 175.2M
+[09:08:38.208] Loaded checkpoint: ./checkpoints_baseline_echocare/clsf_2/best.pth
+[09:08:38.249] Samples: 500
+[09:12:20.744] Saved predictions to: ./clsf_2_val

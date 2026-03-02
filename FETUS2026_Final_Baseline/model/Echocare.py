@@ -370,6 +370,7 @@ class Echocare_UniMatch(nn.Module):
 
         # Per-class residual strength, initialized weak and stable.
         self.prior_logit_scale = nn.Parameter(torch.full((cls_class_num,), -2.1972246))  # sigmoid ~= 0.10
+        self.enable_struct_priors = True
 
     def _sanitize_seg_allowed(self, seg_allowed: Dict[int, List[int]]) -> Dict[int, List[int]]:
         clean = {}
@@ -679,23 +680,29 @@ class Echocare_UniMatch(nn.Module):
                 view_ids = self._flatten_view_ids(view_ids)
                 view_ids_fp = torch.cat([view_ids, view_ids], dim=0)
 
-            with torch.autocast(device_type=x.device.type, enabled=False):
-                cls_logits = self._apply_class_specific_priors(
-                    base_logits=base_logits.float(),
-                    embed=embed.float(),
-                    seg_logits=seg_logits.float(),
-                    view_ids=view_ids_fp,
-                )
+            if self.enable_struct_priors:
+                with torch.autocast(device_type=x.device.type, enabled=False):
+                    cls_logits = self._apply_class_specific_priors(
+                        base_logits=base_logits.float(),
+                        embed=embed.float(),
+                        seg_logits=seg_logits.float(),
+                        view_ids=view_ids_fp,
+                    )
+            else:
+                cls_logits = base_logits.float()
             return seg_logits.chunk(2), cls_logits.chunk(2)
 
         seg_logits = self.seg_net.decode(enc0, enc1, enc2, enc3, enc4, dec4)
         embed = self._pool_embed(dec4)
         base_logits = self.cls_decoder(embed)
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            cls_logits = self._apply_class_specific_priors(
-                base_logits=base_logits.float(),
-                embed=embed.float(),
-                seg_logits=seg_logits.float(),
-                view_ids=view_ids,
-            )
+        if self.enable_struct_priors:
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                cls_logits = self._apply_class_specific_priors(
+                    base_logits=base_logits.float(),
+                    embed=embed.float(),
+                    seg_logits=seg_logits.float(),
+                    view_ids=view_ids,
+                )
+        else:
+            cls_logits = base_logits.float()
         return seg_logits, cls_logits

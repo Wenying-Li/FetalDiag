@@ -55,12 +55,14 @@ Thumbs.db
 /predictions_val/
 /evaluation_results/
 /checkpoints_baseline_echocare/
+/checkpoint_baseline_echocare/
 /other/
 /val/
   
 # Outputs and checkpoints  
 /checkpoints*/  
 /predictions/  
+/predictions*/
 /evaluation_results/  
 *.pth  
 *.pkl  
@@ -80,3 +82,5 @@ ipython_config.py
 *.tmp  
 *.temp  
 .cache/
+
+/external/
