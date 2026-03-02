@@ -83,4 +83,4 @@ ipython_config.py
 *.temp  
 .cache/
 
-/external/
+external/
