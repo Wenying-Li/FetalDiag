@@ -86,3 +86,7 @@ ipython_config.py
 external/
 /external/*
 external/**/*
+/val*/
+/val/*
+/*val/*
+/*val/
