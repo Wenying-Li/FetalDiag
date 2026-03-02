@@ -25,53 +25,44 @@ def safe_get_scalar(dataset_val):
     return int(dataset_val)
 
 def safe_get_label_tuple(dataset_val):
-    """
-    将 (7,) 的 numpy label 转换为 tuple，作为字典的 key
-    例如: array([0, 1, 0...]) -> (0, 1, 0...)
-    """
+    """将 (7,) 的 numpy label 转换为 tuple，作为字典的 key"""
     if isinstance(dataset_val, np.ndarray):
-        # 展平并转为 tuple，确保 hashable
         return tuple(dataset_val.flatten().tolist())
     elif isinstance(dataset_val, list):
         return tuple(dataset_val)
     else:
-        # 如果万一是标量
         return (int(dataset_val),)
 
 def stratified_split_by_view_and_multilabel(filenames, views, labels, valid_ratio=0.2):
-    """
-    根据 (View, Label_Combination) 进行分层
-    """
+    """根据 (View, Label_Combination) 进行分层"""
     group_dict = defaultdict(list)
+    name_to_label = {}  
 
-    # 1. 分组
+    # 1. 分组录入
     for name, view, label in zip(filenames, views, labels):
         v_int = safe_get_scalar(view)
-        l_tuple = safe_get_label_tuple(label)  # 转为 tuple 才能做字典 key
+        l_tuple = safe_get_label_tuple(label)
         
         key = (v_int, l_tuple)
         group_dict[key].append(name)
+        name_to_label[name] = l_tuple  
 
     train_files = []
     valid_files = []
 
-    print(f"\n[Info] Splitting data with Stratified Sampling (View + Label Combination)")
-    print(f"Validation Ratio: {valid_ratio:.0%}")
-    print("-" * 120)
-    print(f"{'View':<6} | {'Label Combination (Length 7)':<35} | {'Total':<8} | {'Train':<8} | {'Valid':<8} | {'Valid %':<8}")
-    print("-" * 120)
-
-    # 排序 keys (tuple 默认可排序)
+    # 2. 初始按比例分配
     sorted_keys = sorted(group_dict.keys())
-
     for key in sorted_keys:
-        view, l_tuple = key
-        files = group_dict[key]
+        files = group_dict[key].copy()
         n_total = len(files)
         
         n_valid = int(n_total * valid_ratio)
         
-        # 随机打乱
+        # 【核心优化】：只要某个组合总数 >= 2，但按比例算下来是 0，强行给验证集分 1 个
+        # 这样能避免绝大多数少数类在第一轮分配时 Validation 变为 0
+        if n_valid == 0 and n_total >= 2:
+            n_valid = 1
+            
         random.shuffle(files)
         
         current_valid = files[:n_valid]
@@ -79,12 +70,71 @@ def stratified_split_by_view_and_multilabel(filenames, views, labels, valid_rati
         
         valid_files.extend(current_valid)
         train_files.extend(current_train)
+
+    # 3. 全局后处理检查 (应对极端情况，例如某个类别的所有组合 total 都等于 1)
+    adjustment_logs = []
+    if filenames:
+        num_classes = len(name_to_label[filenames[0]])
+        val_tp_counts = [0] * num_classes
         
-        # 简单的格式化 label tuple 为字符串以便打印
+        for f in valid_files:
+            lbl = name_to_label[f]
+            for c in range(num_classes):
+                if lbl[c] > 0:
+                    val_tp_counts[c] += 1
+        
+        missing_classes = [c for c in range(num_classes) if val_tp_counts[c] == 0]
+        
+        if missing_classes:
+            for c in missing_classes:
+                if val_tp_counts[c] > 0:
+                    continue
+                found = False
+                for i, f in enumerate(train_files):
+                    lbl = name_to_label[f]
+                    if lbl[c] > 0:
+                        train_files.pop(i)
+                        valid_files.append(f)
+                        for idx in range(num_classes):
+                            if lbl[idx] > 0:
+                                val_tp_counts[idx] += 1
+                        adjustment_logs.append(f"Moved 1 sample to Valid for globally missing Class {c} (Label: {lbl})")
+                        found = True
+                        break
+                if not found:
+                    adjustment_logs.append(f"[Warning] Could not find ANY sample for Class {c} in Train set!")
+
+    # =========================================================================
+    # 4. 打印最终的统计结果 (此时划分已全部落锤固定)
+    # =========================================================================
+    print(f"\n[Info] Splitting data with Stratified Sampling (View + Label Combination)")
+    print(f"Validation Ratio: {valid_ratio:.0%}")
+    
+    if adjustment_logs:
+        print("-" * 120)
+        print("[Post-process Adjustments]")
+        for log in adjustment_logs:
+            print("  -> " + log)
+            
+    print("-" * 120)
+    print(f"{'View':<6} | {'Label Combination (Length 7)':<35} | {'Total':<8} | {'Train':<8} | {'Valid':<8} | {'Valid %':<8}")
+    print("-" * 120)
+
+    final_valid_set = set(valid_files)
+
+    for key in sorted_keys:
+        view, l_tuple = key
+        files = group_dict[key]
+        n_total = len(files)
+        
+        # 根据最终的 valid_files 集合倒推实际属于 Validation 的数量
+        current_valid_count = sum(1 for f in files if f in final_valid_set)
+        current_train_count = n_total - current_valid_count
+        
         label_str = str(l_tuple).replace(" ", "")
-        actual_ratio = len(current_valid) / n_total if n_total > 0 else 0
+        actual_ratio = current_valid_count / n_total if n_total > 0 else 0
         
-        print(f"{view:<6} | {label_str:<35} | {n_total:<8} | {len(current_train):<8} | {len(current_valid):<8} | {actual_ratio:<8.1%}")
+        print(f"{view:<6} | {label_str:<35} | {n_total:<8} | {current_train_count:<8} | {current_valid_count:<8} | {actual_ratio:<8.1%}")
 
     print("-" * 120)
     print(f"{'ALL':<44} | {len(filenames):<8} | {len(train_files):<8} | {len(valid_files):<8} | {len(valid_files)/len(filenames):<8.1%}")
@@ -119,7 +169,6 @@ if __name__ == "__main__":
 
         lbl_path = os.path.join(labels_dir_path, filename.replace('.h5', '_label.h5'))
         with h5py.File(lbl_path, 'r') as f:
-            # 直接读取整个 (7,) 数组，不转 int
             all_labels.append(f['label'][:]) 
 
     random.seed(args.seed)
