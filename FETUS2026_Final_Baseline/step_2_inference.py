@@ -4,20 +4,18 @@ import json
 import logging
 import os
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
-from model.unet import UNet  
-from model.Echocare import Echocare_UniMatch 
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset.fetus_infer import FETUSInferDataset
 from model.unet import UNet
-
+from model.Echocare import Echocare_UniMatch 
 
 DEFAULT_SEG_ALLOWED: Dict[int, List[int]] = {
     0: [0, 1, 2, 3, 4, 5, 6, 7],           # 4CH
@@ -25,6 +23,7 @@ DEFAULT_SEG_ALLOWED: Dict[int, List[int]] = {
     2: [0, 6, 8, 9, 10, 11, 12],           # RVOT
     3: [0, 9, 12, 13, 14],                 # 3VT
 }
+
 
 def build_model(args, device):
     if args.model == "unet":
@@ -45,6 +44,7 @@ def build_model(args, device):
     else:  
         raise ValueError(f"Unknown model: {args.model}")  
     return model.to(device) 
+
 
 def setup_logger(save_dir: str) -> logging.Logger:
     os.makedirs(save_dir, exist_ok=True)
@@ -70,13 +70,23 @@ def count_params_m(model: torch.nn.Module) -> float:
     return sum(p.numel() for p in model.parameters()) / 1e6
 
 
-def load_checkpoint_strict(model: torch.nn.Module, ckpt_path: str, device: torch.device, logger: logging.Logger):
+def load_checkpoint_strict(model: torch.nn.Module, ckpt_path: str, device: torch.device, logger: logging.Logger) -> Optional[List[float]]:
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    
     ckpt = torch.load(ckpt_path, map_location=device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state, strict=True)
-    logger.info(f"Loaded checkpoint: {ckpt_path}")
+    logger.info(f"Loaded checkpoint weights from: {ckpt_path}")
+
+    # Extract best_thresholds from the checkpoint if it exists
+    best_thresholds = None
+    if isinstance(ckpt, dict) and "best_thresholds" in ckpt:
+        best_thresholds = ckpt["best_thresholds"]
+        if best_thresholds is not None:
+            logger.info(f"Successfully extracted 'best_thresholds' from checkpoint: {best_thresholds}")
+
+    return best_thresholds
 
 
 def _load_json_arg(s: Optional[str]):
@@ -174,11 +184,11 @@ def run_inference(
     allowed_mat: torch.Tensor,
     args,
     logger: logging.Logger,
+    thr_pc: Optional[np.ndarray] = None, # Added passing of parsed thresholds
 ):
     model.eval()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    thr_pc = parse_thr_per_class(args.cls_thr_per_class, args.cls_num_classes)
     use_amp = args.amp and (device.type == "cuda")
     amp_dtype = torch.float16 if args.amp_dtype == "fp16" else torch.bfloat16
 
@@ -238,6 +248,7 @@ def run_inference(
             pm = pred_mask_np[b]
             prob = pred_prob_np[b]
 
+            # Use the determined threshold (per-class array or global float fallback)
             pl = prob_to_binary(prob, args.cls_thr, thr_pc)
 
             if (not args.overwrite) and os.path.exists(save_path):
@@ -266,9 +277,11 @@ def parse_args():
                    help="submission format: only binary labels are allowed")
 
     p.add_argument("--cls-thr", type=float, default=0.5,
-                   help="global threshold for classification when label-mode=binary")
+                   help="global fallback threshold for classification when label-mode=binary")
     p.add_argument("--cls-thr-per-class", type=str, default="",
-                   help="comma-separated per-class thresholds, length=cls_num_classes; if set, overrides --cls-thr")
+                   help="comma-separated per-class thresholds; if set, heavily overrides ckpt and global thresholds")
+    p.add_argument("--smooth-ckpt-thr", action="store_true", 
+                   help="smooth the checkpoint thresholds by averaging with 0.5 to prevent extreme overfitting on small val sets")
 
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=2)
@@ -302,7 +315,27 @@ def main():
     model = build_model(args, device)
     logger.info(f"Total params: {count_params_m(model):.1f}M")
 
-    load_checkpoint_strict(model, args.ckpt, device, logger)
+    # Load weights and extract the best_thresholds if available
+    ckpt_thresholds = load_checkpoint_strict(model, args.ckpt, device, logger)
+
+    # Determine which threshold strategy to use
+    thr_pc = None
+    if args.cls_thr_per_class:
+        # 1. Highest priority: Manually specified thresholds via CLI
+        thr_pc = parse_thr_per_class(args.cls_thr_per_class, args.cls_num_classes)
+        logger.info(f"Using CLI overridden per-class thresholds: {thr_pc.tolist()}")
+    elif ckpt_thresholds is not None:
+        # 2. Recommended priority: Extracted from checkpoint
+        thr_pc = np.array(ckpt_thresholds, dtype=np.float32)
+        if args.smooth_ckpt_thr:
+            # Apply softening to prevent extreme thresholds from small validation sets
+            thr_pc = (thr_pc + 0.5) / 2.0
+            logger.info(f"Using SMOOTHED checkpoint thresholds: {np.round(thr_pc, 4).tolist()}")
+        else:
+            logger.info(f"Using EXACT checkpoint thresholds: {np.round(thr_pc, 4).tolist()}")
+    else:
+        # 3. Fallback: Global threshold
+        logger.info(f"Using Global Threshold fallback: {args.cls_thr}")
 
     dataset = FETUSInferDataset(args.data_json)
     loader = DataLoader(
@@ -315,7 +348,7 @@ def main():
     )
     logger.info(f"Samples: {len(dataset)}")
 
-    run_inference(model, loader, device, allowed_mat, args, logger)
+    run_inference(model, loader, device, allowed_mat, args, logger, thr_pc=thr_pc)
 
 
 if __name__ == "__main__":

@@ -121,7 +121,7 @@ def build_model(args, device):
             seg_class_num=args.seg_num_classes,
             cls_class_num=args.cls_num_classes,
             view_num_classes=args.view_num_classes,
-            ssl_checkpoint=args.ssl_ckpt,  # You need to add --ssl-ckpt in args
+            ssl_checkpoint=args.ssl_ckpt,
         )
     else:
         raise ValueError(f"Unknown model: {args.model}")
@@ -144,7 +144,7 @@ def build_optimizer(args, model):
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if "Swin_encoder" in n:      # You defined encoder as backbone
+            if "Swin_encoder" in n:      
                 backbone_params.append(p)
             else:
                 head_params.append(p)
@@ -266,16 +266,18 @@ def build_seg_allowed_mat(device, seg_allowed: Dict[int, List[int]], num_views: 
 def poly_lr(base_lr: float, iters: int, total_iters: int, power: float = 0.9) -> float:
     return base_lr * (1 - iters / total_iters) ** power
 
-
-def maybe_resume(model, optimizer, scaler, ckpt_path: str, logger: logging.Logger):
+# Add: Resume the best thresholds
+def maybe_resume(model, optimizer, scaler, ckpt_path: str, logger: logging.Logger, default_cls_num=7):
     if not os.path.exists(ckpt_path):
-        return -1, 0.0, -1, 0
+        return -1, 0.0, -1, 0, [0.5] * default_cls_num
 
     ckpt = load_pretrained_flexible(model, ckpt_path, logger=logger, key="model")
     start_epoch = int(ckpt.get("epoch", -1))
     best_score = float(ckpt.get("previous_best", 0.0))
     best_epoch = int(ckpt.get("best_epoch", -1))
     global_step = int(ckpt.get("global_step", 0))
+    # Try to load best_thresholds, and if not found or incompatible, fall back to default
+    best_thresholds = ckpt.get("best_thresholds", [0.5] * default_cls_num)
 
     if "optimizer" in ckpt:
         try:
@@ -292,7 +294,7 @@ def maybe_resume(model, optimizer, scaler, ckpt_path: str, logger: logging.Logge
             logger.warning(f"[Resume] Skip GradScaler (incompatible): {e}")
 
     logger.info(f"[Resume] epoch={start_epoch}, best_score={best_score:.4f}, best_epoch={best_epoch}, global_step={global_step}")
-    return start_epoch, best_score, best_epoch, global_step
+    return start_epoch, best_score, best_epoch, global_step, best_thresholds
 
 
 def forward_model(model, image, need_fp: bool = False, view_ids=None):
@@ -312,6 +314,7 @@ def set_prior_usage(model, enabled: bool):
     target = model.module if hasattr(model, "module") else model
     if hasattr(target, "enable_struct_priors"):
         target.enable_struct_priors = bool(enabled)
+
 
 @torch.no_grad()
 def teacher_pseudo(
@@ -703,8 +706,14 @@ def validate(args, model, device, valid_loader, allowed_seg_mat, cls_allowed):
     views_all = np.array(views_all, dtype=np.int32) if len(views_all) else np.zeros((0,), dtype=np.int32)
 
     metrics = masked_metrics_with_threshold_search(y_true_all, y_prob_all, views_all, cls_allowed)
-    macro_f1 = float(metrics["macro_f1@0.5"])
-    score = (mean_dice + mean_nsd) / 2.0 + macro_f1 * 100.0
+    
+    # Combine the two macro F1 scores for better model selection
+    macro_f1_05 = float(metrics["macro_f1@0.5"])
+    macro_f1_best = float(metrics["macro_f1@best"])
+    
+    macro_f1_combined = (macro_f1_05 + macro_f1_best) / 2.0
+    
+    score_combined = (mean_dice + mean_nsd) / 2.0 + macro_f1_combined * 100.0
 
     return {
         "dice_class_view_masked": dice_class,
@@ -713,8 +722,10 @@ def validate(args, model, device, valid_loader, allowed_seg_mat, cls_allowed):
         "mean_dice_view_masked": mean_dice,
         "mean_nsd_view_masked": mean_nsd,
         "metrics": metrics,
-        "macro_f1": macro_f1,
-        "score": float(score),
+        "macro_f1_05": macro_f1_05,
+        "macro_f1_best": macro_f1_best,
+        "macro_f1_combined": macro_f1_combined,
+        "score_combined": float(score_combined),
     }
 
 
@@ -788,13 +799,17 @@ def main():
 
     total_iters = len(train_loader_u) * args.train_epochs
     ckpt_path = os.path.join(args.save_path, "latest.pth")
-    start_epoch, best_score, best_epoch, global_step = maybe_resume(model, optimizer, scaler, ckpt_path, logger)
+    
+    # Read the best thresholds from the checkpoint if resuming
+    start_epoch, best_score, best_epoch, global_step, best_thresholds = maybe_resume(
+        model, optimizer, scaler, ckpt_path, logger, args.cls_num_classes
+    )
 
     for epoch in range(start_epoch + 1, args.train_epochs):
         use_priors_this_epoch = args.no_prior_warmup or (epoch >= args.prior_warmup_epochs)
         set_prior_usage(model, use_priors_this_epoch)
         logger.info(
-            "===========> Epoch: {} | LR: {:.6f} | Best: {:.4f} @ epoch {} | struct_priors={}".format(
+            "===========> Epoch: {} | LR: {:.6f} | Best Combined: {:.4f} @ epoch {} | struct_priors={}".format(
                 epoch, optimizer.param_groups[0]["lr"], best_score, best_epoch, use_priors_this_epoch
             )
         )
@@ -834,8 +849,10 @@ def main():
         logger.info(f"[Seg][ViewMasked] MeanNSD : {val['mean_nsd_view_masked']:.2f}")
 
         m = val["metrics"]
-        logger.info(f"[Cls][Masked] Macro-F1@0.5  : {m['macro_f1@0.5']:.4f}")
-        logger.info(f"[Cls][Masked] Macro-F1@best : {m['macro_f1@best']:.4f}")
+        logger.info(f"[Cls][Masked] Macro-F1@0.5    : {val['macro_f1_05']:.4f}")
+        logger.info(f"[Cls][Masked] Macro-F1@best   : {val['macro_f1_best']:.4f}")
+        logger.info(f"[Cls][Masked] Macro-F1@comb   : {val['macro_f1_combined']:.4f}")
+        
         for k in range(args.cls_num_classes):
             logger.info(
                 f"[Cls][Masked] Class[{k}] "
@@ -846,24 +863,29 @@ def main():
                 f"support={m['support'][k]}"
             )
 
-        score = val["score"]
-        is_best = score > best_score
+        # Use the combined score for determining the best checkpoint
+        score_combined = val["score_combined"]
+        is_best = score_combined > best_score
         if is_best:
-            best_score = score
+            best_score = score_combined
             best_epoch = epoch
+            best_thresholds = m['per_class_best_thr']
 
         logger.info(
-            f"[Val] Epoch {epoch:03d} | score={score:.4f} | "
+            f"[Val] Epoch {epoch:03d} | score_combined={score_combined:.4f} | "
             f"best_score={best_score:.4f} @ epoch {best_epoch:03d} | is_best={is_best}"
         )
 
+        # Add combined score to TensorBoard logs
         log_val_tb(
             writer,
             {
                 "MeanDice_ViewMasked": val["mean_dice_view_masked"],
                 "MeanNSD_ViewMasked": val["mean_nsd_view_masked"],
-                "MacroF1_best": val["macro_f1"],
-                "Score": score,
+                "MacroF1_0.5": val["macro_f1_05"],
+                "MacroF1_best": val["macro_f1_best"],
+                "MacroF1_combined": val["macro_f1_combined"],
+                "Score_combined": score_combined,
             },
             epoch,
             prefix="val",
@@ -878,6 +900,7 @@ def main():
             "previous_best": best_score,
             "best_epoch": best_epoch,
             "global_step": global_step,
+            "best_thresholds": best_thresholds, # add best_thresholds to checkpoint
         }
         torch.save(checkpoint, os.path.join(args.save_path, "latest.pth"))
         if is_best:
