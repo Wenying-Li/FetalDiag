@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.optim import SGD
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
+from sklearn.metrics import confusion_matrix  # Added for confusion matrix calculation
 
 from dataset.fetus import FETUSSemiDataset
 from model.unet import UNet
@@ -177,7 +178,13 @@ def parse_args():
     p.add_argument("--opt", type=str, default='echocare', choices=[None, "unet", "echocare"])
 
     p.add_argument("--ssl-ckpt", type=str, default='./pretrained_weights/echocare_encoder.pth')  # for echocare
-    
+    p.add_argument(
+        "--init-ckpt",
+        type=str,
+        default=None,
+        help="Optional checkpoint for weight initialization only. Loads matching model weights and ignores mismatched keys/shapes.",
+    )
+
     p.add_argument("--train-labeled-json", type=str, default="data/train_labeled.json")
     p.add_argument("--train-unlabeled-json", type=str, default="data/train_unlabeled.json")
     p.add_argument("--valid-labeled-json", type=str, default="data/valid.json")
@@ -232,7 +239,9 @@ def parse_args():
     p.add_argument("--small-sample-seed", type=int, default=42, help="Random seed for deterministic small-sample subset selection.")
 
     p.add_argument("--no-prior-warmup", action="store_true", help="Disable segmentation-prior warmup and keep priors on from epoch 0.")
-    p.add_argument("--prior-warmup-epochs", type=int, default=5, help="Number of initial epochs to keep segmentation priors off when warmup is enabled.")
+    # p.add_argument("--prior-warmup-epochs", type=int, default=5, help="Number of initial epochs to keep segmentation priors off when warmup is enabled.")
+    # Add option to train only segmentation for the first N epochs before introducing classification losses
+    p.add_argument("--seg-only-epochs", type=int, default=20, help="Number of initial epochs to train only segmentation.")
 
     return p.parse_args()
 
@@ -296,6 +305,48 @@ def maybe_resume(model, optimizer, scaler, ckpt_path: str, logger: logging.Logge
     logger.info(f"[Resume] epoch={start_epoch}, best_score={best_score:.4f}, best_epoch={best_epoch}, global_step={global_step}")
     return start_epoch, best_score, best_epoch, global_step, best_thresholds
 
+# Add a new function to load the previous training weights
+def maybe_load_init_ckpt(model, ckpt_path: Optional[str], logger: logging.Logger, key: str = "model"):
+    """
+    Load only compatible model weights from a checkpoint:
+    - if checkpoint contains a dict with `key`, use ckpt[key]
+    - otherwise treat the checkpoint itself as a state_dict
+    - only load parameters whose names exist in current model and whose shapes match
+    - ignore everything else
+    """
+    if not ckpt_path:
+        return
+    if not os.path.exists(ckpt_path):
+        logger.warning(f"[Init] Checkpoint not found: {ckpt_path}")
+        return
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    state_dict = ckpt.get(key, ckpt) if isinstance(ckpt, dict) else ckpt
+
+    if not isinstance(state_dict, dict):
+        logger.warning(f"[Init] Invalid checkpoint format: {ckpt_path}")
+        return
+
+    model_state = model.state_dict()
+    loadable_state = {}
+    skipped = []
+
+    for k, v in state_dict.items():
+        if k in model_state and model_state[k].shape == v.shape:
+            loadable_state[k] = v
+        else:
+            skipped.append(k)
+
+    msg = model.load_state_dict(loadable_state, strict=False)
+
+    logger.info(
+        f"[Init] Loaded {len(loadable_state)} matched tensors from {ckpt_path}; "
+        f"skipped {len(skipped)} mismatched/unexpected tensors."
+    )
+    if msg.missing_keys:
+        logger.info(f"[Init] Missing keys after partial load: {msg.missing_keys}")
+    if msg.unexpected_keys:
+        logger.info(f"[Init] Unexpected keys after partial load: {msg.unexpected_keys}")
 
 def forward_model(model, image, need_fp: bool = False, view_ids=None):
     """Compatibility wrapper: pass view_ids when supported, otherwise fall back."""
@@ -365,6 +416,9 @@ def train_one_epoch(
     total_iters: int,
 ):
     model.train()
+    
+    # Check if we are in the segmentation-only pretraining phase
+    is_seg_only = epoch < args.seg_only_epochs
 
     meters = {
         "loss": AverageMeter(),
@@ -490,13 +544,6 @@ def train_one_epoch(
             loss_x_seg = (criterion_seg_ce(pred_x, mask_x) +
                           criterion_seg_dice(pred_x.softmax(dim=1), mask_x.unsqueeze(1).float())) / 2.0
 
-            loss_x_cls = masked_bce_with_logits(
-                pred_x_class, class_label_x.float(), mask_x_allowed, pos_weight=pos_weight
-            )
-            loss_x_fp_cls = masked_bce_with_logits(
-                pred_x_class_fp, class_label_x.float(), mask_x_allowed, pos_weight=pos_weight
-            )
-
             loss_u_s1_seg = criterion_seg_dice(
                 pred_u_s1.softmax(dim=1),
                 mask_u_w_c1.unsqueeze(1).float(),
@@ -524,32 +571,53 @@ def train_one_epoch(
                 ignore=(conf_u_w_mix < args.conf_thresh).float(),
             )
 
-            loss_u_s1_mix_cls = masked_bce_with_logits(
-                pred_class_u_s1_mix, p_t, mask_u_cls, pos_weight=pos_weight
-            )
-            loss_u_s2_mix_cls = masked_bce_with_logits(
-                pred_class_u_s2_mix, p_t, mask_u_cls, pos_weight=pos_weight
-            )
-            loss_u_pseudo_cls = 0.5 * (loss_u_s1_mix_cls + loss_u_s2_mix_cls)
+            if not is_seg_only:
+                # Calculate classification losses
+                loss_x_cls = masked_bce_with_logits(
+                    pred_x_class, class_label_x.float(), mask_x_allowed, pos_weight=pos_weight
+                )
+                loss_x_fp_cls = masked_bce_with_logits(
+                    pred_x_class_fp, class_label_x.float(), mask_x_allowed, pos_weight=pos_weight
+                )
+                
+                loss_u_s1_mix_cls = masked_bce_with_logits(
+                    pred_class_u_s1_mix, p_t, mask_u_cls, pos_weight=pos_weight
+                )
+                loss_u_s2_mix_cls = masked_bce_with_logits(
+                    pred_class_u_s2_mix, p_t, mask_u_cls, pos_weight=pos_weight
+                )
+                loss_u_pseudo_cls = 0.5 * (loss_u_s1_mix_cls + loss_u_s2_mix_cls)
 
-            p_u_w_mix = torch.sigmoid(pred_class_u_w_mix)
-            p_u_w_mix_fp = torch.sigmoid(pred_class_u_w_mix_fp)
-            loss_u_w_mix_cls = masked_mse(p_u_w_mix, p_t, mask_u_cls)
-            loss_u_w_mix_fp_cls = masked_mse(p_u_w_mix_fp, p_t, mask_u_cls)
+                p_u_w_mix = torch.sigmoid(pred_class_u_w_mix)
+                p_u_w_mix_fp = torch.sigmoid(pred_class_u_w_mix_fp)
+                loss_u_w_mix_cls = masked_mse(p_u_w_mix, p_t, mask_u_cls)
+                loss_u_w_mix_fp_cls = masked_mse(p_u_w_mix_fp, p_t, mask_u_cls)
+            else:
+                # Skip classification computation and set dummy zero tensors for logging
+                loss_x_cls = torch.tensor(0.0, device=device)
+                loss_x_fp_cls = torch.tensor(0.0, device=device)
+                loss_u_pseudo_cls = torch.tensor(0.0, device=device)
+                loss_u_w_mix_cls = torch.tensor(0.0, device=device)
+                loss_u_w_mix_fp_cls = torch.tensor(0.0, device=device)
 
             loss = (
                 loss_w["x_seg"] * loss_x_seg
-                + loss_w["x_cls"] * loss_x_cls
-                + loss_w["x_fp_cls"] * loss_x_fp_cls
                 + loss_w["u_s1_seg"] * loss_u_s1_seg
                 + loss_w["u_s2_seg"] * loss_u_s2_seg
                 + loss_w["u_w_fp_seg"] * loss_u_w_fp_seg
                 + loss_w["u_s1_mix_seg"] * loss_u_s1_mix_seg
                 + loss_w["u_s2_mix_seg"] * loss_u_s2_mix_seg
-                + loss_w["u_pseudo_cls"] * loss_u_pseudo_cls
-                + loss_w["u_w_mix_cls"] * loss_u_w_mix_cls
-                + loss_w["u_w_mix_fp_cls"] * loss_u_w_mix_fp_cls
             )
+
+            if not is_seg_only:
+                # Add classification losses into graph to enable backward propagation
+                loss += (
+                    loss_w["x_cls"] * loss_x_cls
+                    + loss_w["x_fp_cls"] * loss_x_fp_cls
+                    + loss_w["u_pseudo_cls"] * loss_u_pseudo_cls
+                    + loss_w["u_w_mix_cls"] * loss_u_w_mix_cls
+                    + loss_w["u_w_mix_fp_cls"] * loss_u_w_mix_fp_cls
+                )
 
         optimizer.zero_grad(set_to_none=True)
         if use_amp and scaler is not None and amp_dtype == torch.float16:
@@ -640,13 +708,18 @@ def train_one_epoch(
     return global_step
 
 @torch.no_grad()
-def validate(args, model, device, valid_loader, allowed_seg_mat, cls_allowed):
+def validate(args, model, device, valid_loader, allowed_seg_mat, cls_allowed, allowed_cls_mat=None, pos_weight=None):
     model.eval()
 
     C = args.seg_num_classes
     K = args.cls_num_classes
     tol = 2.0
     use_hard_view_mask = not args.no_hard_view_mask
+
+    # Setup loss criteria for validation monitoring
+    criterion_seg_ce = torch.nn.CrossEntropyLoss()
+    criterion_seg_dice = DiceLoss(n_classes=args.seg_num_classes)
+    val_loss_meter = AverageMeter()
 
     dice_sum = np.zeros(C - 1, dtype=np.float64)
     nsd_sum = np.zeros(C - 1, dtype=np.float64)
@@ -659,14 +732,53 @@ def validate(args, model, device, valid_loader, allowed_seg_mat, cls_allowed):
         gt_mask = mask.to(device)
         class_label = class_label.to(device)
         v = view.to(device).long().view(-1)
-
+        
+        # --- Loss Calculation Start ---
+        # 1. Forward original size for loss? 
+        # Usually val loss is calculated on original or resized. 
+        # The original code resizes input to 'resize_target' for prediction.
+        # We'll use the resized input for loss consistency with training, 
+        # but note that val loader outputs original size images usually? 
+        # Assuming dataset returns resized images if 'size' arg is used, 
+        # but 'valid' set might be original size.
+        # Let's perform resize if needed or just use what we have.
+        # The dataset class 'FETUSSemiDataset' with "valid" usually returns original.
+        # The loop below resizes manually.
+        
         h, w = image.shape[-2:]
         image_rs = F.interpolate(
             image, (args.resize_target, args.resize_target),
             mode="bilinear", align_corners=False
         )
+        mask_rs = F.interpolate(
+            gt_mask.unsqueeze(1).float(), (args.resize_target, args.resize_target),
+            mode="nearest"
+        ).squeeze(1).long()
 
         pred_mask_logits_rs, pred_class_out = forward_model(model, image_rs, need_fp=False, view_ids=v)
+
+        # Compute validation loss (Seg + Cls)
+        # Apply masks if needed for loss
+        pred_seg_for_loss = pred_mask_logits_rs
+        if use_hard_view_mask:
+            pred_seg_for_loss = apply_view_mask_logits(pred_seg_for_loss, v, allowed_seg_mat)
+
+        loss_val_seg = (criterion_seg_ce(pred_seg_for_loss, mask_rs) +
+                        criterion_seg_dice(pred_seg_for_loss.softmax(dim=1), mask_rs.unsqueeze(1).float())) / 2.0
+        
+        loss_val_cls = torch.tensor(0.0, device=device)
+        if allowed_cls_mat is not None:
+            mask_val_allowed = allowed_cls_mat[v]
+            # Use pos_weight if provided, else None
+            loss_val_cls = masked_bce_with_logits(
+                pred_class_out, class_label.float(), mask_val_allowed, pos_weight=pos_weight
+            )
+        
+        # Simple sum for monitoring
+        batch_val_loss = loss_val_seg + loss_val_cls
+        val_loss_meter.update(batch_val_loss.item(), image.size(0))
+        # --- Loss Calculation End ---
+
         pred_mask_logits = F.interpolate(
             pred_mask_logits_rs, (h, w),
             mode="bilinear", align_corners=False
@@ -707,11 +819,31 @@ def validate(args, model, device, valid_loader, allowed_seg_mat, cls_allowed):
 
     metrics = masked_metrics_with_threshold_search(y_true_all, y_prob_all, views_all, cls_allowed)
     
+    # Calculate Confusion Matrices (Per Class and Total) at threshold 0.5
+    # We must respect the allowed views for each class
+    confusion_matrices = {}
+    total_cm = np.zeros((2, 2), dtype=np.int64)
+    
+    for k in range(K):
+        # Filter indices where class k is allowed for the view
+        valid_indices = [i for i, v_id in enumerate(views_all) if k in cls_allowed.get(int(v_id), [])]
+        
+        if len(valid_indices) > 0:
+            y_true_k = y_true_all[valid_indices, k]
+            y_prob_k = y_prob_all[valid_indices, k]
+            y_pred_k = (y_prob_k >= 0.5).astype(int) # Threshold 0.5
+            
+            cm_k = confusion_matrix(y_true_k, y_pred_k, labels=[0, 1])
+            confusion_matrices[k] = cm_k
+            total_cm += cm_k
+        else:
+            confusion_matrices[k] = np.zeros((2, 2), dtype=np.int64)
+
     # Combine the two macro F1 scores for better model selection
     macro_f1_05 = float(metrics["macro_f1@0.5"])
     macro_f1_best = float(metrics["macro_f1@best"])
     
-    macro_f1_combined = (macro_f1_05 + macro_f1_best) / 2.0
+    macro_f1_combined = macro_f1_05*0.4 + macro_f1_best*0.6
     
     score_combined = (mean_dice + mean_nsd) / 2.0 + macro_f1_combined * 100.0
 
@@ -726,6 +858,9 @@ def validate(args, model, device, valid_loader, allowed_seg_mat, cls_allowed):
         "macro_f1_best": macro_f1_best,
         "macro_f1_combined": macro_f1_combined,
         "score_combined": float(score_combined),
+        "val_loss": val_loss_meter.avg, # Added
+        "confusion_matrices": confusion_matrices, # Added
+        "total_confusion_matrix": total_cm, # Added
     }
 
 
@@ -747,14 +882,16 @@ def main():
     logger.info(f"cls_allowed: {cls_allowed}")
     logger.info(f"loss_weights: {loss_w}")
     logger.info(f"pseudo_tau_pos={args.pseudo_tau_pos}, pseudo_tau_neg={args.pseudo_tau_neg}")
-    logger.info(f"prior_warmup_enabled={not args.no_prior_warmup}, prior_warmup_epochs={args.prior_warmup_epochs}")
+    # logger.info(f"prior_warmup_enabled={not args.no_prior_warmup}, prior_warmup_epochs={args.prior_warmup_epochs}")
     logger.info(f"small_sample={args.small_sample}, ratio={args.small_sample_ratio}, min_cases={args.small_sample_min_cases}, seed={args.small_sample_seed}")
+    logger.info(f"seg_only_epochs={args.seg_only_epochs}")
 
     tb_logdir = args.tb_logdir or os.path.join(args.save_path, "tb")
     writer = SummaryWriter(log_dir=tb_logdir)
     logger.info(f"TensorBoard logdir: {tb_logdir}")
 
     model = build_model(args, device)
+    maybe_load_init_ckpt(model, args.init_ckpt, logger)
     optimizer, base_lrs = build_optimizer(args, model)
 
     
@@ -807,10 +944,12 @@ def main():
 
     for epoch in range(start_epoch + 1, args.train_epochs):
         use_priors_this_epoch = args.no_prior_warmup or (epoch >= args.prior_warmup_epochs)
+        is_seg_only = epoch < args.seg_only_epochs
+        
         set_prior_usage(model, use_priors_this_epoch)
         logger.info(
-            "===========> Epoch: {} | LR: {:.6f} | Best Combined: {:.4f} @ epoch {} | struct_priors={}".format(
-                epoch, optimizer.param_groups[0]["lr"], best_score, best_epoch, use_priors_this_epoch
+            "===========> Epoch: {} | LR: {:.6f} | Best Combined: {:.4f} @ epoch {} | struct_priors={} | seg_only={}".format(
+                epoch, optimizer.param_groups[0]["lr"], best_score, best_epoch, use_priors_this_epoch, is_seg_only
             )
         )
 
@@ -835,9 +974,11 @@ def main():
             total_iters=total_iters,
         )
 
-        val = validate(args, model, device, valid_loader, allowed_seg_mat, cls_allowed)
+        val = validate(args, model, device, valid_loader, allowed_seg_mat, cls_allowed, allowed_cls_mat, pos_weight)
 
         logger.info("===== Validation =====")
+        logger.info(f"Validation Loss: {val['val_loss']:.4f}") # Log Val Loss
+        
         for cls_idx in range(args.seg_num_classes - 1):
             logger.info(
                 f"[Seg][ViewMasked] Class[{cls_idx+1}] "
@@ -853,14 +994,21 @@ def main():
         logger.info(f"[Cls][Masked] Macro-F1@best   : {val['macro_f1_best']:.4f}")
         logger.info(f"[Cls][Masked] Macro-F1@comb   : {val['macro_f1_combined']:.4f}")
         
+        # Log Confusion Matrices
+        logger.info("[Cls] Confusion Matrices (Threshold=0.5):")
+        total_cm_str = str(val['total_confusion_matrix']).replace('\n', ', ')
+        logger.info(f"Total CM: {total_cm_str}")
+        
         for k in range(args.cls_num_classes):
+            cm_str = str(val['confusion_matrices'][k]).replace('\n', ', ')
             logger.info(
                 f"[Cls][Masked] Class[{k}] "
                 f"F1@0.5={m['per_class_f1@0.5'][k]:.4f} | "
                 f"F1@best={m['per_class_f1@best'][k]:.4f} | "
                 f"best_thr={m['per_class_best_thr'][k]:.2f} | "
                 f"AUPRC={m['per_class_auprc'][k]:.4f} | "
-                f"support={m['support'][k]}"
+                f"support={m['support'][k]} | "
+                f"CM={cm_str}" # Log Confusion Matrix per class
             )
 
         # Use the combined score for determining the best checkpoint
@@ -886,11 +1034,18 @@ def main():
                 "MacroF1_best": val["macro_f1_best"],
                 "MacroF1_combined": val["macro_f1_combined"],
                 "Score_combined": score_combined,
+                "Val_Loss": val["val_loss"], # Added to TB
             },
             epoch,
             prefix="val",
         )
         log_val_perclass_tb(writer, val["dice_class_view_masked"], val["nsd_class_view_masked"], epoch)
+        
+        # Log AUPRC per class to TensorBoard
+        for k in range(args.cls_num_classes):
+            writer.add_scalar(f"val_cls/AUPRC_class_{k}", m['per_class_auprc'][k], epoch)
+        writer.add_scalar("val_cls/Mean_AUPRC", np.mean(m['per_class_auprc']), epoch)
+
 
         checkpoint = {
             "model": model.state_dict(),

@@ -229,13 +229,29 @@ class SwinUNETR_Seg(nn.Module):
         dec4 = self.encoder10(hidden_states_out[4])
         return enc0, enc1, enc2, enc3, enc4, dec4
 
-    def decode(self, enc0, enc1, enc2, enc3, enc4, dec4):
+    def decode_with_features(self, enc0, enc1, enc2, enc3, enc4, dec4):
         dec3 = self.decoder5(dec4, enc4)
         dec2 = self.decoder4(dec3, enc3)
         dec1 = self.decoder3(dec2, enc2)
         dec0 = self.decoder2(dec1, enc1)
         out = self.decoder1(dec0, enc0)
         logits = self.out(out)
+        return logits, {
+            "enc0": enc0,
+            "enc1": enc1,
+            "enc2": enc2,
+            "enc3": enc3,
+            "enc4": enc4,
+            "dec4": dec4,
+            "dec3": dec3,
+            "dec2": dec2,
+            "dec1": dec1,
+            "dec0": dec0,
+            "out": out,
+        }
+
+    def decode(self, enc0, enc1, enc2, enc3, enc4, dec4):
+        logits, _ = self.decode_with_features(enc0, enc1, enc2, enc3, enc4, dec4)
         return logits
 
     def reset_parameters(self):
@@ -338,8 +354,23 @@ class Echocare_UniMatch(nn.Module):
         bottleneck_dim = self.seg_net.bottleneck_dim
         hidden_dim = 512
 
+        self.cls_feature_dims = [
+            64,   # enc0
+            64,   # enc1
+            128,  # enc2
+            256,  # enc3
+            512,  # enc4
+            1024, # dec4
+            512,  # dec3
+            256,  # dec2
+            128,  # dec1
+            64,   # dec0
+            64,   # out
+        ]
+        self.cls_feature_dim = sum(self.cls_feature_dims)
+
         self.cls_decoder = nn.Sequential(
-            nn.Linear(bottleneck_dim, hidden_dim),
+            nn.Linear(self.cls_feature_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, cls_class_num),
         )
@@ -349,28 +380,29 @@ class Echocare_UniMatch(nn.Module):
         self.seg_allowed = self._sanitize_seg_allowed(seg_allowed or self.DEFAULT_SEG_ALLOWED)
         self.cls_allowed = self._sanitize_cls_allowed(cls_allowed or self.DEFAULT_CLS_ALLOWED)
 
-        # disease-specific feature dimensions
-        self.struct_feature_dims = {
-            0: 10,  # Ventricular Septal Defect
-            2: 9,   # Aortic Hypoplasia
-            4: 10,  # Double Outlet Right Ventricle
-            5: 10,  # Pulmonary Valve Stenosis
-            6: 8,   # Right Aortic Arch
-        }
-
-        self.struct_heads = nn.ModuleDict()
-        for cls_idx in self.STRUCTURAL_CLASSES:
-            if cls_idx < self.cls_class_num:
-                feat_dim = self.struct_feature_dims[cls_idx]
-                self.struct_heads[str(cls_idx)] = nn.Sequential(
-                    nn.Linear(bottleneck_dim + feat_dim, struct_hidden_dim),
-                    nn.ReLU(inplace=True),
-                    nn.Linear(struct_hidden_dim, 1),
-                )
-
-        # Per-class residual strength, initialized weak and stable.
-        self.prior_logit_scale = nn.Parameter(torch.full((cls_class_num,), -2.1972246))  # sigmoid ~= 0.10
-        self.enable_struct_priors = True
+        # The original classification branch used disease-specific, hand-crafted geometric priors.
+        # Per request, that path is disabled and kept only as commented legacy logic.
+        # self.struct_feature_dims = {
+        #     0: 10,  # Ventricular Septal Defect
+        #     2: 9,   # Aortic Hypoplasia
+        #     4: 10,  # Double Outlet Right Ventricle
+        #     5: 10,  # Pulmonary Valve Stenosis
+        #     6: 8,   # Right Aortic Arch
+        # }
+        #
+        # self.struct_heads = nn.ModuleDict()
+        # for cls_idx in self.STRUCTURAL_CLASSES:
+        #     if cls_idx < self.cls_class_num:
+        #         feat_dim = self.struct_feature_dims[cls_idx]
+        #         self.struct_heads[str(cls_idx)] = nn.Sequential(
+        #             nn.Linear(bottleneck_dim + feat_dim, struct_hidden_dim),
+        #             nn.ReLU(inplace=True),
+        #             nn.Linear(struct_hidden_dim, 1),
+        #         )
+        #
+        # # Per-class residual strength, initialized weak and stable.
+        # self.prior_logit_scale = nn.Parameter(torch.full((cls_class_num,), -2.1972246))  # sigmoid ~= 0.10
+        self.enable_struct_priors = False
 
     def _sanitize_seg_allowed(self, seg_allowed: Dict[int, List[int]]) -> Dict[int, List[int]]:
         clean = {}
@@ -396,6 +428,10 @@ class Echocare_UniMatch(nn.Module):
 
     def _pool_embed(self, feat_bchw: torch.Tensor) -> torch.Tensor:
         return F.adaptive_avg_pool2d(feat_bchw, 1).flatten(1)
+
+    def _build_multiscale_embed(self, feature_maps: Iterable[torch.Tensor]) -> torch.Tensor:
+        pooled = [self._pool_embed(feat) for feat in feature_maps]
+        return torch.cat(pooled, dim=1)
 
     def _flatten_view_ids(self, view_ids: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if view_ids is None:
@@ -501,7 +537,7 @@ class Echocare_UniMatch(nn.Module):
                 "conf": conf,
             }
         return stats
-
+    '''
     def _extract_disease_features(self, seg_logits: torch.Tensor, view_ids: Optional[torch.Tensor] = None) -> Dict[int, torch.Tensor]:
         """
         Build detached, disease-specific, low-dimensional anatomy descriptors.
@@ -649,7 +685,8 @@ class Echocare_UniMatch(nn.Module):
 
         final_logits = torch.nan_to_num(final_logits, nan=0.0, posinf=20.0, neginf=-20.0)
         return final_logits
-
+    '''
+    
     def forward(self, x, need_fp: bool = False, view_ids: Optional[torch.Tensor] = None):
         """
         Returns logits (not sigmoid probabilities), consistent with BCEWithLogits usage.
@@ -671,8 +708,22 @@ class Echocare_UniMatch(nn.Module):
             p_enc4 = torch.cat([enc4, self.fp_dropout(enc4)], dim=0)
             p_dec4 = torch.cat([dec4, self.fp_dropout(dec4)], dim=0)
 
-            seg_logits = self.seg_net.decode(p_enc0, p_enc1, p_enc2, p_enc3, p_enc4, p_dec4)
-            embed = self._pool_embed(p_dec4)
+            seg_logits, cls_feature_maps = self.seg_net.decode_with_features(
+                p_enc0, p_enc1, p_enc2, p_enc3, p_enc4, p_dec4
+            )
+            embed = self._build_multiscale_embed([
+                cls_feature_maps["enc0"],
+                cls_feature_maps["enc1"],
+                cls_feature_maps["enc2"],
+                cls_feature_maps["enc3"],
+                cls_feature_maps["enc4"],
+                cls_feature_maps["dec4"],
+                cls_feature_maps["dec3"],
+                cls_feature_maps["dec2"],
+                cls_feature_maps["dec1"],
+                cls_feature_maps["dec0"],
+                cls_feature_maps["out"],
+            ])
             base_logits = self.cls_decoder(embed)
 
             view_ids_fp = None
@@ -680,29 +731,45 @@ class Echocare_UniMatch(nn.Module):
                 view_ids = self._flatten_view_ids(view_ids)
                 view_ids_fp = torch.cat([view_ids, view_ids], dim=0)
 
-            if self.enable_struct_priors:
-                with torch.autocast(device_type=x.device.type, enabled=False):
-                    cls_logits = self._apply_class_specific_priors(
-                        base_logits=base_logits.float(),
-                        embed=embed.float(),
-                        seg_logits=seg_logits.float(),
-                        view_ids=view_ids_fp,
-                    )
-            else:
-                cls_logits = base_logits.float()
+            # Legacy hand-crafted geometric prior path is intentionally disabled.
+            # if self.enable_struct_priors:
+            #     with torch.autocast(device_type=x.device.type, enabled=False):
+            #         cls_logits = self._apply_class_specific_priors(
+            #             base_logits=base_logits.float(),
+            #             embed=embed.float(),
+            #             seg_logits=seg_logits.float(),
+            #             view_ids=view_ids_fp,
+            #         )
+            # else:
+            #     cls_logits = base_logits.float()
+            cls_logits = base_logits.float()
             return seg_logits.chunk(2), cls_logits.chunk(2)
 
-        seg_logits = self.seg_net.decode(enc0, enc1, enc2, enc3, enc4, dec4)
-        embed = self._pool_embed(dec4)
+        seg_logits, cls_feature_maps = self.seg_net.decode_with_features(enc0, enc1, enc2, enc3, enc4, dec4)
+        embed = self._build_multiscale_embed([
+            cls_feature_maps["enc0"],
+            cls_feature_maps["enc1"],
+            cls_feature_maps["enc2"],
+            cls_feature_maps["enc3"],
+            cls_feature_maps["enc4"],
+            cls_feature_maps["dec4"],
+            cls_feature_maps["dec3"],
+            cls_feature_maps["dec2"],
+            cls_feature_maps["dec1"],
+            cls_feature_maps["dec0"],
+            cls_feature_maps["out"],
+        ])
         base_logits = self.cls_decoder(embed)
-        if self.enable_struct_priors:
-            with torch.autocast(device_type=x.device.type, enabled=False):
-                cls_logits = self._apply_class_specific_priors(
-                    base_logits=base_logits.float(),
-                    embed=embed.float(),
-                    seg_logits=seg_logits.float(),
-                    view_ids=view_ids,
-                )
-        else:
-            cls_logits = base_logits.float()
+        # Legacy hand-crafted geometric prior path is intentionally disabled.
+        # if self.enable_struct_priors:
+        #     with torch.autocast(device_type=x.device.type, enabled=False):
+        #         cls_logits = self._apply_class_specific_priors(
+        #             base_logits=base_logits.float(),
+        #             embed=embed.float(),
+        #             seg_logits=seg_logits.float(),
+        #             view_ids=view_ids,
+        #         )
+        # else:
+        #     cls_logits = base_logits.float()
+        cls_logits = base_logits.float()
         return seg_logits, cls_logits

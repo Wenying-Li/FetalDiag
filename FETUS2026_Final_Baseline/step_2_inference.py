@@ -24,6 +24,13 @@ DEFAULT_SEG_ALLOWED: Dict[int, List[int]] = {
     3: [0, 9, 12, 13, 14],                 # 3VT
 }
 
+DEFAULT_CLS_ALLOWED: Dict[int, List[int]] = {
+    0: [0, 1],
+    1: [0, 2, 3],
+    2: [4, 5],
+    3: [2, 5, 6],
+}
+
 
 def build_model(args, device):
     if args.model == "unet":
@@ -116,6 +123,22 @@ def load_seg_allowed(seg_allowed_arg: Optional[str], default: Dict[int, List[int
     return out
 
 
+# NEW: Dedicated function for loading classification allowed mapping
+def load_cls_allowed(cls_allowed_arg: Optional[str], default: Dict[int, List[int]]) -> Dict[int, List[int]]:
+    raw = _load_json_arg(cls_allowed_arg)
+    if raw is None:
+        return default
+    if not isinstance(raw, dict):
+        raise ValueError("--cls-allowed must be a JSON object: {view_id: [class_ids...]}")
+    out: Dict[int, List[int]] = {}
+    for k, v in raw.items():
+        kk = int(k)
+        if not isinstance(v, (list, tuple)):
+            raise ValueError(f"cls_allowed[{k}] must be a list.")
+        out[kk] = [int(x) for x in v]
+    return out
+
+
 def build_allowed_mat(device: torch.device, seg_allowed: Dict[int, List[int]], num_views: int, num_classes: int) -> torch.Tensor:
     mat = torch.zeros((num_views, num_classes), dtype=torch.bool, device=device)
     for v in range(num_views):
@@ -125,6 +148,20 @@ def build_allowed_mat(device: torch.device, seg_allowed: Dict[int, List[int]], n
         for c in cls_ids:
             if c < 0 or c >= num_classes:
                 raise ValueError(f"seg_allowed[{v}] contains invalid class id {c} for num_classes={num_classes}")
+        mat[v, cls_ids] = True
+    return mat
+
+
+# NEW: Dedicated function for building classification mask matrix
+def build_cls_allowed_mat(device: torch.device, cls_allowed: Dict[int, List[int]], num_views: int, num_classes: int) -> torch.Tensor:
+    mat = torch.zeros((num_views, num_classes), dtype=torch.bool, device=device)
+    for v in range(num_views):
+        if v not in cls_allowed:
+            raise ValueError(f"cls_allowed is missing view {v}")
+        cls_ids = cls_allowed[v]
+        for c in cls_ids:
+            if c < 0 or c >= num_classes:
+                raise ValueError(f"cls_allowed[{v}] contains invalid class id {c} for num_classes={num_classes}")
         mat[v, cls_ids] = True
     return mat
 
@@ -182,6 +219,7 @@ def run_inference(
     loader: DataLoader,
     device: torch.device,
     allowed_mat: torch.Tensor,
+    cls_allowed_mat: torch.Tensor,  # NEW: Classification mask matrix
     args,
     logger: logging.Logger,
     thr_pc: Optional[np.ndarray] = None, # Added passing of parsed thresholds
@@ -222,7 +260,6 @@ def run_inference(
         )
 
         with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
-            # UNet returns (seg_logits, cls_logits)
             pred_mask_logits_rs, pred_class_out = model(image_rs)
 
         pred_mask_logits = F.interpolate(
@@ -231,6 +268,7 @@ def run_inference(
         )
 
         if args.mask_mode == "oracle":
+            # Apply segmentation mask
             masked_logits = apply_view_mask_logits(pred_mask_logits, view_oracle, allowed_mat)
         elif args.mask_mode == "none":
             masked_logits = pred_mask_logits
@@ -239,6 +277,12 @@ def run_inference(
 
         pred_mask = masked_logits.argmax(dim=1)      # (B,H,W)
         pred_prob = torch.sigmoid(pred_class_out)    # (B,K)
+
+        # NEW: Apply classification mask if mask_mode is oracle
+        if args.mask_mode == "oracle":
+            # cls_allowed_mat[view_oracle] gives us a (B, K) boolean mask
+            valid_cls_mask = cls_allowed_mat[view_oracle] 
+            pred_prob = pred_prob * valid_cls_mask.float()
 
         pred_mask_np = pred_mask.detach().cpu().numpy().astype(np.uint8)
         pred_prob_np = pred_prob.detach().cpu().numpy().astype(np.float32)
@@ -287,12 +331,15 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--gpu", type=str, default="0")
 
-    # No view head in current UNet, so only oracle / none are supported.
     p.add_argument("--mask-mode", type=str, default="oracle", choices=["oracle", "none"],
                    help="oracle: mask seg logits with dataset-provided view; none: no masking")
 
     p.add_argument("--seg-allowed", type=str, default=None,
                    help="JSON string or .json path for segmentation allowed mapping {view_id:[class_ids...]}")
+    
+    # NEW: Command line argument for classification mapping
+    p.add_argument("--cls-allowed", type=str, default=None,
+                   help="JSON string or .json path for classification allowed mapping {view_id:[class_ids...]}")
 
     p.add_argument("--amp", action="store_true", help="enable autocast")
     p.add_argument("--amp-dtype", type=str, default="fp16", choices=["fp16", "bf16"])
@@ -309,8 +356,13 @@ def main():
     logger.info(str(args))
     logger.info(f"Device: {device}")
 
+    # Build Segmentation Mask
     seg_allowed = load_seg_allowed(args.seg_allowed, DEFAULT_SEG_ALLOWED)
     allowed_mat = build_allowed_mat(device, seg_allowed, args.view_num_classes, args.seg_num_classes)
+
+    # NEW: Build Classification Mask using the new dedicated functions
+    cls_allowed = load_cls_allowed(args.cls_allowed, DEFAULT_CLS_ALLOWED)
+    cls_allowed_mat = build_cls_allowed_mat(device, cls_allowed, args.view_num_classes, args.cls_num_classes)
 
     model = build_model(args, device)
     logger.info(f"Total params: {count_params_m(model):.1f}M")
@@ -348,7 +400,8 @@ def main():
     )
     logger.info(f"Samples: {len(dataset)}")
 
-    run_inference(model, loader, device, allowed_mat, args, logger, thr_pc=thr_pc)
+    #  NEW: Pass the cls_allowed_mat to the inference function
+    run_inference(model, loader, device, allowed_mat, cls_allowed_mat, args, logger, thr_pc=thr_pc)
 
 
 if __name__ == "__main__":
