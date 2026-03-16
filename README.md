@@ -1,6 +1,3 @@
-Here is the updated README reflecting that this is a challenge implementation rather than a baseline.
-
-```markdown name=README.md
 # FetalDiag: UniMatch Implementation for ISBS2026 Fetal Ultrasound Analysis Challenge
 
 This repository contains a solution using semi-supervised learning (UniMatch) for the **ISBS2026 Fetal Ultrasound Analysis Challenge**. It is designed for the segmentation and classification of fetal ultrasound images, supporting multi-view analysis including 4CH, LVOT, RVOT, and 3VT views.
@@ -96,4 +93,4 @@ The evaluation script reports:
 The system uses default mappings for anatomical views and classes:
 - **Views**: 4CH (0), LVOT (1), RVOT (2), 3VT (3).
 - **Allowed Maps**: JSON mappings define which classes are valid for which views (see `DEFAULT_SEG_ALLOWED` in scripts).
-```
+
