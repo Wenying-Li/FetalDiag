@@ -129,6 +129,33 @@ def build_model(args, device):
 
     return model.to(device)
 
+def configure_trainable_params(args, model, logger: Optional[logging.Logger] = None):
+    """
+    Configure trainable parameters according to training mode.
+
+    --cls_only:
+      - freeze everything
+      - unfreeze classification head only (cls_decoder)
+    """
+    if not getattr(args, "cls_only", False):
+        return
+
+    # freeze all params first
+    for _, p in model.named_parameters():
+        p.requires_grad = False
+
+    trainable_names = []
+    for name, p in model.named_parameters():
+        if name.startswith("cls_decoder."):
+            p.requires_grad = True
+            trainable_names.append(name)
+
+    if logger is not None:
+        total = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"cls_only=True | trainable params: {trainable}/{total}")
+        logger.info(f"cls_only trainable modules: {trainable_names}")
+
 def build_optimizer(args, model):
     opt_name = args.opt or args.model
 
@@ -238,10 +265,15 @@ def parse_args():
     p.add_argument("--small-sample-min-cases", type=int, default=16, help="Minimum number of unlabeled cases to keep in small-sample mode.")
     p.add_argument("--small-sample-seed", type=int, default=42, help="Random seed for deterministic small-sample subset selection.")
 
-    p.add_argument("--no-prior-warmup", action="store_true", help="Disable segmentation-prior warmup and keep priors on from epoch 0.")
+    # p.add_argument("--no-prior-warmup", action="store_true", help="Disable segmentation-prior warmup and keep priors on from epoch 0.")
     # p.add_argument("--prior-warmup-epochs", type=int, default=5, help="Number of initial epochs to keep segmentation priors off when warmup is enabled.")
     # Add option to train only segmentation for the first N epochs before introducing classification losses
     p.add_argument("--seg-only-epochs", type=int, default=20, help="Number of initial epochs to train only segmentation.")
+    p.add_argument(
+        "--cls_only",
+        action="store_true",
+        help="Train classification head only. Freeze encoder and all segmentation-related parameters.",
+    )
 
     return p.parse_args()
 
@@ -417,8 +449,10 @@ def train_one_epoch(
 ):
     model.train()
     
+    is_cls_only = args.cls_only
     # Check if we are in the segmentation-only pretraining phase
-    is_seg_only = epoch < args.seg_only_epochs
+    # cls_only should override seg_only_epochs, otherwise classification loss would be skipped.
+    is_seg_only = epoch < args.seg_only_epochs and (not is_cls_only)
 
     meters = {
         "loss": AverageMeter(),
@@ -541,35 +575,43 @@ def train_one_epoch(
             pred_u_s2_mix = apply_view_mask_logits(pred_u_s2_mix, view_u_mix, allowed_seg_mat)
 
         with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
-            loss_x_seg = (criterion_seg_ce(pred_x, mask_x) +
-                          criterion_seg_dice(pred_x.softmax(dim=1), mask_x.unsqueeze(1).float())) / 2.0
+            if not is_cls_only:
+                loss_x_seg = (criterion_seg_ce(pred_x, mask_x) +
+                              criterion_seg_dice(pred_x.softmax(dim=1), mask_x.unsqueeze(1).float())) / 2.0
 
-            loss_u_s1_seg = criterion_seg_dice(
-                pred_u_s1.softmax(dim=1),
-                mask_u_w_c1.unsqueeze(1).float(),
-                ignore=(conf_u_w_c1 < args.conf_thresh).float(),
-            )
-            loss_u_s2_seg = criterion_seg_dice(
-                pred_u_s2.softmax(dim=1),
-                mask_u_w_c2.unsqueeze(1).float(),
-                ignore=(conf_u_w_c2 < args.conf_thresh).float(),
-            )
-            loss_u_w_fp_seg = criterion_seg_dice(
-                pred_u_w_fp.softmax(dim=1),
-                mask_u_w.unsqueeze(1).float(),
-                ignore=(conf_u_w < args.conf_thresh).float(),
-            )
+                loss_u_s1_seg = criterion_seg_dice(
+                    pred_u_s1.softmax(dim=1),
+                    mask_u_w_c1.unsqueeze(1).float(),
+                    ignore=(conf_u_w_c1 < args.conf_thresh).float(),
+                )
+                loss_u_s2_seg = criterion_seg_dice(
+                    pred_u_s2.softmax(dim=1),
+                    mask_u_w_c2.unsqueeze(1).float(),
+                    ignore=(conf_u_w_c2 < args.conf_thresh).float(),
+                )
+                loss_u_w_fp_seg = criterion_seg_dice(
+                    pred_u_w_fp.softmax(dim=1),
+                    mask_u_w.unsqueeze(1).float(),
+                    ignore=(conf_u_w < args.conf_thresh).float(),
+                )
 
-            loss_u_s1_mix_seg = criterion_seg_dice(
-                pred_u_s1_mix.softmax(dim=1),
-                mask_u_w_mix.unsqueeze(1).float(),
-                ignore=(conf_u_w_mix < args.conf_thresh).float(),
-            )
-            loss_u_s2_mix_seg = criterion_seg_dice(
-                pred_u_s2_mix.softmax(dim=1),
-                mask_u_w_mix.unsqueeze(1).float(),
-                ignore=(conf_u_w_mix < args.conf_thresh).float(),
-            )
+                loss_u_s1_mix_seg = criterion_seg_dice(
+                    pred_u_s1_mix.softmax(dim=1),
+                    mask_u_w_mix.unsqueeze(1).float(),
+                    ignore=(conf_u_w_mix < args.conf_thresh).float(),
+                )
+                loss_u_s2_mix_seg = criterion_seg_dice(
+                    pred_u_s2_mix.softmax(dim=1),
+                    mask_u_w_mix.unsqueeze(1).float(),
+                    ignore=(conf_u_w_mix < args.conf_thresh).float(),
+                )
+            else:
+                loss_x_seg = torch.tensor(0.0, device=device)
+                loss_u_s1_seg = torch.tensor(0.0, device=device)
+                loss_u_s2_seg = torch.tensor(0.0, device=device)
+                loss_u_w_fp_seg = torch.tensor(0.0, device=device)
+                loss_u_s1_mix_seg = torch.tensor(0.0, device=device)
+                loss_u_s2_mix_seg = torch.tensor(0.0, device=device)
 
             if not is_seg_only:
                 # Calculate classification losses
@@ -600,14 +642,17 @@ def train_one_epoch(
                 loss_u_w_mix_cls = torch.tensor(0.0, device=device)
                 loss_u_w_mix_fp_cls = torch.tensor(0.0, device=device)
 
-            loss = (
-                loss_w["x_seg"] * loss_x_seg
-                + loss_w["u_s1_seg"] * loss_u_s1_seg
-                + loss_w["u_s2_seg"] * loss_u_s2_seg
-                + loss_w["u_w_fp_seg"] * loss_u_w_fp_seg
-                + loss_w["u_s1_mix_seg"] * loss_u_s1_mix_seg
-                + loss_w["u_s2_mix_seg"] * loss_u_s2_mix_seg
-            )
+            loss = torch.tensor(0.0, device=device)
+
+            if not is_cls_only:
+                loss += (
+                    loss_w["x_seg"] * loss_x_seg
+                    + loss_w["u_s1_seg"] * loss_u_s1_seg
+                    + loss_w["u_s2_seg"] * loss_u_s2_seg
+                    + loss_w["u_w_fp_seg"] * loss_u_w_fp_seg
+                    + loss_w["u_s1_mix_seg"] * loss_u_s1_mix_seg
+                    + loss_w["u_s2_mix_seg"] * loss_u_s2_mix_seg
+                )
 
             if not is_seg_only:
                 # Add classification losses into graph to enable backward propagation
@@ -892,6 +937,7 @@ def main():
 
     model = build_model(args, device)
     maybe_load_init_ckpt(model, args.init_ckpt, logger)
+    configure_trainable_params(args, model, logger) # Freeze encoder and segmentation parameters when cls_only is set
     optimizer, base_lrs = build_optimizer(args, model)
 
     
@@ -942,8 +988,11 @@ def main():
         model, optimizer, scaler, ckpt_path, logger, args.cls_num_classes
     )
 
+    logger.info(f"cls_only={args.cls_only}")
+
     for epoch in range(start_epoch + 1, args.train_epochs):
-        use_priors_this_epoch = args.no_prior_warmup or (epoch >= args.prior_warmup_epochs)
+        # use_priors_this_epoch = args.no_prior_warmup or (epoch >= args.prior_warmup_epochs)
+        use_priors_this_epoch = False # Disable priors for all epochs since it didn't work well in early experiments. Can re-enable later with better tuning.
         is_seg_only = epoch < args.seg_only_epochs
         
         set_prior_usage(model, use_priors_this_epoch)
@@ -1057,9 +1106,22 @@ def main():
             "global_step": global_step,
             "best_thresholds": best_thresholds, # add best_thresholds to checkpoint
         }
+
+        # always save latest
         torch.save(checkpoint, os.path.join(args.save_path, "latest.pth"))
+
+        # save best
         if is_best:
             torch.save(checkpoint, os.path.join(args.save_path, "best.pth"))
+
+        # save per-epoch checkpoint when Macro-F1@0.5 > 0.3
+        if val["macro_f1_05"] > 0.3:
+            epoch_ckpt_path = os.path.join(args.save_path, f"epoch_{epoch}.pth")
+            torch.save(checkpoint, epoch_ckpt_path)
+            logger.info(
+                f"[Checkpoint] Saved epoch checkpoint: {epoch_ckpt_path} "
+                f"(Macro-F1@0.5={val['macro_f1_05']:.4f} > 0.3)"
+            )
 
     writer.close()
 

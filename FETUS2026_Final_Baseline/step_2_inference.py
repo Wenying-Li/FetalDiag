@@ -206,6 +206,50 @@ def make_output_path(out_dir: str, image_h5_path: str) -> str:
     return os.path.join(out_dir, os.path.basename(image_h5_path))
 
 
+@torch.inference_mode()
+def forward_with_cls_logit_debug(model: torch.nn.Module, image_rs: torch.Tensor):
+    """
+    Returns:
+        pred_mask_logits_rs: segmentation logits at resized resolution
+        pred_class_out: final classification logits used by downstream inference
+        cls_debug: dict containing cls-head-related debug tensors (or None)
+    """
+    if hasattr(model, "module"):
+        raw_model = model.module
+    else:
+        raw_model = model
+
+    if not isinstance(raw_model, Echocare_UniMatch):
+        pred_mask_logits_rs, pred_class_out = model(image_rs)
+        return pred_mask_logits_rs, pred_class_out, None
+
+    x3 = raw_model.in_adapter(image_rs)
+    enc0, enc1, enc2, enc3, enc4, dec4 = raw_model.seg_net.encode(x3)
+    pred_mask_logits_rs, cls_feature_maps = raw_model.seg_net.decode_with_features(enc0, enc1, enc2, enc3, enc4, dec4)
+
+    embed = raw_model._build_multiscale_embed([
+        cls_feature_maps["enc0"],
+        cls_feature_maps["enc1"],
+        cls_feature_maps["enc2"],
+        cls_feature_maps["enc3"],
+        cls_feature_maps["enc4"],
+        cls_feature_maps["dec4"],
+        cls_feature_maps["dec3"],
+        cls_feature_maps["dec2"],
+        cls_feature_maps["dec1"],
+        cls_feature_maps["dec0"],
+        cls_feature_maps["out"],
+    ])
+    base_logits = raw_model.cls_decoder(embed)
+    final_cls_logits = base_logits.float()
+
+    cls_debug = {
+        "base_logits": base_logits.detach(),
+        "final_cls_logits": final_cls_logits.detach(),
+    }
+    return pred_mask_logits_rs, final_cls_logits, cls_debug
+
+
 def save_pred_h5(save_path: str, pred_mask_hw: np.ndarray, pred_label_k: np.ndarray):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     with h5py.File(save_path, "w") as f:
@@ -229,6 +273,11 @@ def run_inference(
 
     use_amp = args.amp and (device.type == "cuda")
     amp_dtype = torch.float16 if args.amp_dtype == "fp16" else torch.bfloat16
+
+    pos_logit_sum = 0.0
+    pos_logit_count = 0
+    neg_logit_sum = 0.0
+    neg_logit_count = 0
 
     for batch in tqdm(loader, total=len(loader), desc="Infer"):
         # Expected dataset output: (image, view_oracle, image_h5_path)
@@ -260,7 +309,7 @@ def run_inference(
         )
 
         with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
-            pred_mask_logits_rs, pred_class_out = model(image_rs)
+            pred_mask_logits_rs, pred_class_out, cls_debug = forward_with_cls_logit_debug(model, image_rs)
 
         pred_mask_logits = F.interpolate(
             pred_mask_logits_rs, (H, W),
@@ -287,13 +336,47 @@ def run_inference(
         pred_mask_np = pred_mask.detach().cpu().numpy().astype(np.uint8)
         pred_prob_np = pred_prob.detach().cpu().numpy().astype(np.float32)
 
+        cls_logits_np = pred_class_out.detach().cpu().numpy().astype(np.float32)
+        pred_label_np = prob_to_binary(pred_prob_np, args.cls_thr, thr_pc).astype(np.uint8)
+        valid_cls_np = np.ones_like(pred_label_np, dtype=bool)
+        if args.mask_mode == "oracle":
+            valid_cls_np = valid_cls_mask.detach().cpu().numpy().astype(bool)
+        pos_mask = pred_label_np.astype(bool) & valid_cls_np
+        neg_mask = (~pred_label_np.astype(bool)) & valid_cls_np
+        if pos_mask.any():
+            pos_logit_sum += float(cls_logits_np[pos_mask].sum())
+            pos_logit_count += int(pos_mask.sum())
+        if neg_mask.any():
+            neg_logit_sum += float(cls_logits_np[neg_mask].sum())
+            neg_logit_count += int(neg_mask.sum())
+
         for b in range(B):
             save_path = make_output_path(args.out_dir, paths[b])
             pm = pred_mask_np[b]
             prob = pred_prob_np[b]
 
             # Use the determined threshold (per-class array or global float fallback)
-            pl = prob_to_binary(prob, args.cls_thr, thr_pc)
+            pl = pred_label_np[b]
+
+            if cls_debug is not None:
+                base_logits_row = cls_debug["base_logits"][b].detach().cpu().tolist()
+                final_logits_row = cls_debug["final_cls_logits"][b].detach().cpu().tolist()
+                '''
+                logger.info(
+                    "[CLS-LOGITS] file=%s base_logits=%s final_cls_logits=%s pred_prob=%s",
+                    paths[b],
+                    base_logits_row,
+                    final_logits_row,
+                    prob.tolist(),
+                )
+                '''
+                logger.info(
+                    "[CLS-LOGITS] file=%s base_logits=%s pred_prob=%s",
+                    paths[b],
+                    base_logits_row,
+                    # final_logits_row,
+                    prob.tolist(),
+                )
 
             if (not args.overwrite) and os.path.exists(save_path):
                 logger.warning(f"Skip existing (overwrite disabled): {save_path}")
@@ -301,6 +384,15 @@ def run_inference(
 
             save_pred_h5(save_path, pm, pl)
 
+    avg_pos_logit = (pos_logit_sum / pos_logit_count) if pos_logit_count > 0 else float("nan")
+    avg_neg_logit = (neg_logit_sum / neg_logit_count) if neg_logit_count > 0 else float("nan")
+    logger.info(
+        "[CLS-LOGIT-SUMMARY] avg_positive_logit=%.6f (count=%d) avg_negative_logit=%.6f (count=%d)",
+        avg_pos_logit,
+        pos_logit_count,
+        avg_neg_logit,
+        neg_logit_count,
+    )
     logger.info(f"Saved predictions to: {args.out_dir}")
 
 

@@ -90,3 +90,6 @@ external/**/*
 /val/*
 /*val/*
 /*val/
+
+*weights/
+*weight/
